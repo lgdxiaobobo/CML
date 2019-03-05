@@ -279,8 +279,9 @@ package object jyb {
       val idx = 
         rng.nextInt(ptrs(u+1) - ptrs(u)) + ptrs(u)
       val i = indices.apply(idx)
-      val js = 
-        Array.fill(nNeg){items.apply(rng.nextInt(dz))}
+      val js = Array.fill(nNeg){
+        items.apply(rng.nextInt(dz))
+      }
       (u, i, js)
     }
   }
@@ -297,5 +298,30 @@ package object jyb {
         else
           (j1, fj1, sj1)
     }
+  }
+
+  def rankLoss(pos0: Array[Int], pos1: Array[Int],
+               wu: Factor, matH: Map[Int, Factor]):
+  Double = {
+    val allItemsWithScore = 
+      matH.map{case (j, hj) => (j, distance2(wu, hj))}
+    val used = (pos0 ++ pos1).toSet
+    val negsWithScores = allItemsWithScore
+      .filter{case (j, _) => !used.contains(j)}
+    val ranks = pos1.map{i =>
+      val dui = allItemsWithScore(i)
+      negsWithScores.foldLeft(0){
+        case (agg, (_, duj)) =>
+          if (duj <= dui)
+            agg + 1
+          else 
+            agg
+      }
+    }
+    val sz = pos1.length
+    ranks.map{r => 
+      math.log(2.0) /
+        math.log(r + 2.0)
+    }.sum * 1.0 / sz
   }
 }
