@@ -96,7 +96,7 @@ object test {
       Paths.get(checkDir, "valid").toString
     deleteIfExists(sc, validDir)
     result.as[(Int, Array[Int], Array[Int])].rdd
-      .filter(_._2.nonEmpty)
+      .filter(_._3.nonEmpty)
       .map{case (u, pos0, pos1) =>
         val uStr = u.toString
         val pos0Str = pos0.mkString(",")
