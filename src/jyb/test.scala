@@ -6,6 +6,7 @@ import sql.SparkSession
 import sql.DataFrame
 import sql.functions._
 import spark.rdd.RDD
+import java.nio.file.Paths
 
 object test {
 
@@ -49,7 +50,7 @@ object test {
         remains.randomSplit(Array(80, 20), rng.nextLong() ^ cv)
       val train = parts(0)
       val valid = parts(1)
-      val validDF = getValidDF(ss, train, valid)
+      val validDF = getValidDF(ss, train, valid, checkDir)
       val (matW, matH) =
         model.train(train, validDF, rng.nextLong(), maxIter)
       val loss = model.eval(validDF, matW, matH)
@@ -57,9 +58,8 @@ object test {
     }
   }
 
-  def getValidDF(ss: SparkSession,
-                 train: RDD[Usage],
-                 valid: RDD[Usage]):
+  def getValidDF(ss: SparkSession, train: RDD[Usage],
+                 valid: RDD[Usage], checkDir: String):
   DataFrame = {
     import ss.implicits._
     val sc = ss.sparkContext
@@ -93,7 +93,7 @@ object test {
     joint.unpersist()
     // check off
     val validDir =
-      "/checkPoint/app_with_sementic/CML/valid"
+      Paths.get(checkDir, "valid").toString
     deleteIfExists(sc, validDir)
     result.as[(Int, Array[Int], Array[Int])].rdd
       .filter(_._2.nonEmpty)
