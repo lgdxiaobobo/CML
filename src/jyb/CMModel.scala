@@ -48,7 +48,7 @@ case class FMModel(param: Param, batchPerIter: Int) {
   }
 
   private var checkDir =
-    "/checkPoint/fml"
+    "/checkPoint/cml"
   def setCheckDir(dir: String):
   this.type = {
     this.checkDir = dir
@@ -56,10 +56,10 @@ case class FMModel(param: Param, batchPerIter: Int) {
   }
 
   // fml training
-  def train(R: RDD[Usage], test: DataFrame,
+  def train(R: RDD[Usage], valid: DataFrame,
             seed: Long, maxIter: Int):
   (RDD[(Int, Factor)], Map[Int, Factor]) = {
-    val ss = test.sparkSession
+    val ss = valid.sparkSession
     val sc = ss.sparkContext
     val userPart = new FMPart(numUserBlocks)
     // rid off dependency
@@ -83,6 +83,12 @@ case class FMModel(param: Param, batchPerIter: Int) {
       itemFactors.map{case (k, _) => (k, 0.0)}
     // training with drop-out
     for (step <- 0 until maxIter){
+      // store user_with_factor_in_blocks
+      userFactors = 
+        checkFactors(userFactors, checkDir, "userFactors")      
+      // store user_with_sum_of_grads^2_in_blocks
+      userSumGrads =
+        checkSumGrads(userSumGrads, checkDir, "userGrads")      
       // get loss
       val trainLoss =
         getBlockedRankLoss(userInBlocks, userFactors, itemFactors)
@@ -92,25 +98,26 @@ case class FMModel(param: Param, batchPerIter: Int) {
             block.srcIds.view.zip(factors)
         }.flatMap(_._2).setName(s"$step-W")
           .persist(intermediateStorage)
-      val testLoss =
-        getRankLoss(test, userWithFactor, itemFactors)
+      val validLoss =
+        getRankLoss(valid, userWithFactor, itemFactors)
       userWithFactor.unpersist()
-      println(s"[$step] train-loss is $trainLoss, test rank loss is $testLoss")
+      println(s"[$step rank loss] train: $trainLoss, valid: $validLoss")
       // batch-gd
       for (iter <- 0 until batchPerIter){
-        val seed0 = seedGen.nextLong() | iter ^ step
+        val iterSeed = seedGen.nextLong() | iter ^ step
         val preUserFactors =
           userFactors.setName(s"$iter-W")
             .persist(intermediateStorage)
         // get gradient
         val (userGrads, itemGrads) =
-          learnGradient(userInBlocks, preUserFactors, itemFactors, nItems, seed0)
+          learnGradient(userInBlocks, preUserFactors, 
+            itemFactors, nItems, iterSeed)
         // adagrad
         val preUserSumGrads =
           userSumGrads.setName(s"$iter-SGW")
             .persist(intermediateStorage)
         userSumGrads =
-          getAdaGrads(preUserSumGrads, userGrads)
+          getSumGrads(preUserSumGrads, userGrads)
         itemSumGrads =
           itemGrads.foldLeft(itemSumGrads){
             case (dict, (k, gk)) =>
@@ -136,8 +143,6 @@ case class FMModel(param: Param, batchPerIter: Int) {
         preUserSumGrads.unpersist()
         preUserFactors.unpersist()
       }
-      userFactors = 
-        checkFactors(userFactors, checkDir, "userFactors")
     }
     val userWithFactor =
       userInBlocks.join(userFactors).mapValues{
@@ -149,45 +154,28 @@ case class FMModel(param: Param, batchPerIter: Int) {
     (userWithFactor, itemFactors)
   }
 
-  def getRankLoss(test: DataFrame,
+  def getRankLoss(valid: DataFrame,
                   matW: RDD[(Int, Array[Double])],
                   matH: Map[Int, Array[Double]]):
   Double = {
-    // assume test: Row(u, pos, neg)
-    val ss = test.sparkSession
+    // assume valid: Row(u, pos0, pos1)
+    val ss = valid.sparkSession
     val sc = ss.sparkContext
     import ss.implicits._
-    val rDF = test.toDF("u", "pos", "neg")
+    val rDF = valid.toDF("u", "pos0", "pos1")
       .as("R").persist(intermediateStorage)
     val wDF = matW.toDF("u", "wu")
       .as("W").persist(intermediateStorage)
     val t1 = rDF.join(wDF, rDF("u") === wDF("u"))
-      .select("R.pos", "R.neg", "W.wu")
-      .toDF("pos", "neg", "wu")
+      .select("R.pos0", "R.pos1", "W.wu")
+      .toDF("pos0", "pos1", "wu")
       .as("T1").persist(intermediateStorage)
     t1.count()
     rDF.unpersist()
     wDF.unpersist()
     val hBD = sc.broadcast(matH)
-    // positive less than negative
-    // rank = #{neg but distance less than pos}
-    val rankLoss =
-      (pos: Array[Int], neg: Array[Int], wu: Array[Double]) => {
-        val sz = pos.length
-        val negDistance = 
-          neg.map(j => distance2(hBD.value(j), wu))
-        val posDistance = 
-          pos.map(i => distance2(hBD.value(i), wu))
-        val DG = posDistance.foldLeft(0.0){
-          case (dg, dui) =>
-            val rank = 
-              negDistance.count(_ <= dui)
-            dg + math.log(2.0) / math.log(2.0 + rank)
-        }
-        div(DG, sz)
-      }
     val loss = t1.as[(Array[Int], Array[Int], Array[Double])].rdd
-      .map{case (pos, neg, wu) => rankLoss(pos, neg, wu)}
+      .map{case (pos0, pos1, wu) => rankLoss(pos0, pos1, wu, hBD.value)}
       .mean()
     t1.unpersist()
     loss
@@ -208,28 +196,38 @@ case class FMModel(param: Param, batchPerIter: Int) {
           collection.mutable.ArrayBuilder.make[Double]
         for (u <- srcIds.indices){
           val wu = factors(u)
-          val distanceFromUser = 
-            hBD.value.toArray.map{
+          // distance from items to users
+          val allScores = 
+            hBD.value.map{
               case (i, hi) =>
                 (i, distance2(wu, hi))
             }
+          // indices about used items
           val pu = getIndices(dstIndices, 
             dstPtrs(u), dstPtrs(u+1))
+          // get rank for each items
+          val used = pu.toSet
           pu.foreach{i =>
-            val hi = hBD.value(i)
-            val dui = distance2(wu, hi)
-            val imposters = 
-              distanceFromUser.map{
-                case (j, duj) =>
-                  if (j == i)
-                    -1.0
-                  else
-                    dui - duj
+            val dui = allScores(i)
+            val (_emax, _rank) = 
+              allScores.foldLeft((0.0, 0)){
+                case ((e0, r0), (j, duj)) =>
+                  if (used.contains(j))
+                    (e0, r0)
+                  else{
+                    val dij = dui - duj
+                    if (dij >= 0) {
+                      val e1 = 
+                        if (dij >= e0) dij else e0
+                      val r1 = r0 + 1
+                      (e1, r1)
+                    }else{
+                      (e0, r0)
+                    }
+                  }
               }
-            val _rank =
-              imposters.count(_ >= 0)
             errorsBuilder += 
-              imposters.max * math.log(_rank + 2.0) / math.log(2.0)
+              _emax * math.log(_rank + 2.0) / math.log(2.0)
           }
         }
         errorsBuilder.result()
@@ -343,7 +341,7 @@ case class FMModel(param: Param, batchPerIter: Int) {
     newFactors
   }
 
-  def getAdaGrads(sumGrads: RDD[(Int, Array[Double])],
+  def getSumGrads(sumGrads: RDD[(Int, Array[Double])],
                   grads: RDD[(Int, Array[Factor])]):
   RDD[(Int, Array[Double])] = {
     sumGrads.join(grads).mapValues{
@@ -356,57 +354,63 @@ case class FMModel(param: Param, batchPerIter: Int) {
 
   def learnGradient(srcInBlock: RDD[(Int, InBlock)],
                     srcFactors: RDD[(Int, Array[Factor])],
-                    matH: Map[Int, Factor], nItems: Int, seed0: Long):
+                    matH: Map[Int, Factor], nItems: Int, 
+                    seed0: Long):
   (RDD[(Int, Array[Factor])], Array[(Int, Factor)]) = {
     val sc = srcInBlock.sparkContext
     val hBD = sc.broadcast(matH)   
     val rng = new util.Random(seed0)
     // only max {w(u,i) * |m+d(u,i)^2-d(u,i')^2|} would be considered
-    val joint = srcInBlock.join(srcFactors).mapValues{
-      case (block, factors) =>
-        val dstPtrs = block.dstPtrs
-        val dstIndices = block.dstIndices
-        val items = hBD.value.keys.toArray
-        val batches = 
-          getBatches(dstPtrs, dstIndices, items, batchSize, negNum, rng.nextLong())
-        val gu = factors.map(f => f.map(_ => 0.0))
-        val giBuilder =
-          collection.mutable.ArrayBuilder.make[(Int, Factor)]
-        batches.foreach{case (u, i, js) =>
-            val wu = factors(u)
-            val hi = hBD.value(i)
-            val _dui = plus(wu, hi, -1.0)
-            val _fui = dropOut(_dui, drop, rng.nextLong())
-            val dui = norm2(_fui)
-            val _fujs = js.map{j =>
-              val hj = hBD.value(j)
-              val _duj = plus(wu, hj, -1.0)
-              val _fuj = dropOut(_duj, drop, rng.nextLong())
-              (j, _fuj)
-            }
-            val negWithDis = _fujs.map{
-              case (j, _fuj) =>
-                (j, _fuj, margin + dui - norm2(_fuj))
-            } 
-            val imposters = negWithDis.filter{
-              case (j, _, xuj) => j != i && xuj >= 0
-            }
-            if (imposters.nonEmpty){
-              val rank = 
-                predictRank(nItems, imposters.length, negNum)
-              val wui = 
-                math.log(rank + 2.0) / math.log(2.0)
-              val (j, _fuj, _) =
-                findMaxNeg(imposters)
-              // update gradients based on user
-              val temp = plus(_fui, _fuj, -1.0)
-              gu(u) = plus(gu(u), temp, 2 * wui)
-              // update gradients based on items
-              giBuilder += ((i, weighted(_fui, -2 * wui)))
-              giBuilder += ((j, weighted(_fuj, 2 * wui)))
-            }
+    val joint = srcInBlock.join(srcFactors)
+    .mapValues{ case (block, factors) =>
+      val dstPtrs = block.dstPtrs
+      val dstIndices = block.dstIndices
+      val items = hBD.value.keys.toArray
+      val batches = 
+        getBatches(dstPtrs, dstIndices, items, 
+          batchSize, negNum, rng.nextLong())
+      val gu = 
+        factors.map(f => f.map(_ => 0.0))
+      val giBuilder =
+        collection.mutable.ArrayBuilder.make[(Int, Factor)]
+      batches.foreach{case (u, i, js) =>
+        val wu = factors(u)
+        val hi = hBD.value(i)
+        val _dui = plus(wu, hi, -1.0)
+        val _fui = dropOut(_dui, drop, rng.nextLong())
+        val dui = norm2(_fui)
+        // get rank(u, i)
+        // get max{margin + dui - duj}
+        val _fujs = js.map{j =>
+          val hj = hBD.value(j)
+          val _duj = plus(wu, hj, -1.0)
+          val _fuj = dropOut(_duj, drop, rng.nextLong())
+          (j, _fuj)
         }
-        (gu, giBuilder.result())
+        val negWithDis = _fujs.map{
+          case (j, _fuj) =>
+            val duj = norm2(_fuj)
+            (j, _fuj, margin + dui - duj)
+        } 
+        val imposters = negWithDis.filter{
+          case (j, _, xuj) => j != i && xuj >= 0
+        }
+        if (imposters.nonEmpty){
+          val rank = 
+            predictRank(nItems, imposters.length, negNum)
+          val wui = 
+            math.log(rank + 2.0) / math.log(2.0)
+          val (j, _fuj, _) =
+            findMaxNeg(imposters)
+          // update gradients based on user
+          val _fuij = plus(_fui, _fuj, -1.0)
+          gu(u) = plus(gu(u), _fuij, 2 * wui)
+          // update gradients based on items
+          giBuilder += ((i, weighted(_fui, -2 * wui)))
+          giBuilder += ((j, weighted(_fuj, 2 * wui)))
+        }
+      }
+      (gu, giBuilder.result())
     }
     val gu = joint.mapValues(_._1)
     val gi = joint.map(_._2._2).flatMap(p => p)
